@@ -211,3 +211,98 @@
     (ok true)
   )
 )
+
+
+
+(define-map campaign-categories 
+  { category-id: uint }
+  { name: (string-ascii 50) }
+)
+
+(define-map campaign-category-mapping
+  { campaign-id: uint }
+  { category-id: uint }
+)
+
+(define-public (add-category (category-id uint) (name (string-ascii 50)))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set campaign-categories
+      { category-id: category-id }
+      { name: name }
+    )
+    (ok true)
+  )
+)
+
+(define-public (set-campaign-category (campaign-id uint) (category-id uint))
+  (let ((campaign (unwrap! (get-campaign campaign-id) err-not-found)))
+    (asserts! (is-eq tx-sender (get owner campaign)) err-unauthorized)
+    (map-set campaign-category-mapping
+      { campaign-id: campaign-id }
+      { category-id: category-id }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-campaigns-by-category (category-id uint))
+  (ok (map-get? campaigns { campaign-id: category-id }))
+)
+
+(define-map campaign-updates
+  { campaign-id: uint, update-id: uint }
+  {
+    title: (string-ascii 100),
+    content: (string-ascii 500),
+    block-height: uint
+  }
+)
+
+(define-map campaign-milestones
+  { campaign-id: uint, milestone-id: uint }
+  {
+    title: (string-ascii 100),
+    target-amount: uint,
+    is-reached: bool
+  }
+)
+
+(define-data-var next-update-id uint u1)
+(define-data-var next-milestone-id uint u1)
+
+(define-public (post-update (campaign-id uint) (title (string-ascii 100)) (content (string-ascii 500)))
+  (let 
+    ((campaign (unwrap! (get-campaign campaign-id) err-not-found))
+     (update-id (var-get next-update-id)))
+    (asserts! (is-eq tx-sender (get owner campaign)) err-unauthorized)
+    (map-set campaign-updates
+      { campaign-id: campaign-id, update-id: update-id }
+      { 
+        title: title,
+        content: content,
+        block-height: stacks-block-height 
+      }
+    )
+    (var-set next-update-id (+ update-id u1))
+    (ok update-id)
+  )
+)
+
+(define-public (add-milestone (campaign-id uint) (title (string-ascii 100)) (target-amount uint))
+  (let 
+    ((campaign (unwrap! (get-campaign campaign-id) err-not-found))
+     (milestone-id (var-get next-milestone-id)))
+    (asserts! (is-eq tx-sender (get owner campaign)) err-unauthorized)
+    (map-set campaign-milestones
+      { campaign-id: campaign-id, milestone-id: milestone-id }
+      {
+        title: title,
+        target-amount: target-amount,
+        is-reached: false
+      }
+    )
+    (var-set next-milestone-id (+ milestone-id u1))
+    (ok milestone-id)
+  )
+)

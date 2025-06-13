@@ -306,3 +306,132 @@
     (ok milestone-id)
   )
 )
+
+
+(define-map matching-pledges
+  { campaign-id: uint, sponsor: principal }
+  {
+    match-ratio: uint,
+    max-match-amount: uint,
+    current-matched: uint,
+    is-active: bool
+  }
+)
+
+(define-map matched-donations
+  { campaign-id: uint, donor: principal, sponsor: principal }
+  { matched-amount: uint }
+)
+
+(define-constant err-invalid-ratio (err u111))
+(define-constant err-match-exceeded (err u112))
+(define-constant err-match-inactive (err u113))
+
+(define-public (create-matching-pledge (campaign-id uint) (match-ratio uint) (max-match-amount uint))
+  (let ((campaign (unwrap! (get-campaign campaign-id) err-not-found)))
+    (asserts! (> match-ratio u0) err-invalid-ratio)
+    (asserts! (<= match-ratio u100) err-invalid-ratio)
+    (asserts! (> max-match-amount u0) err-zero-amount)
+    (asserts! (< stacks-block-height (get deadline campaign)) err-deadline-passed)
+    
+    (try! (stx-transfer? max-match-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set matching-pledges
+      { campaign-id: campaign-id, sponsor: tx-sender }
+      {
+        match-ratio: match-ratio,
+        max-match-amount: max-match-amount,
+        current-matched: u0,
+        is-active: true
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (donate-with-matching (campaign-id uint) (amount uint) (sponsor principal))
+  (let 
+    ((campaign (unwrap! (get-campaign campaign-id) err-not-found))
+     (pledge (unwrap! (map-get? matching-pledges { campaign-id: campaign-id, sponsor: sponsor }) err-not-found))
+     (match-amount (/ (* amount (get match-ratio pledge)) u100))
+     (available-match (- (get max-match-amount pledge) (get current-matched pledge)))
+     (actual-match (if (<= match-amount available-match) match-amount available-match))
+     (current-donation (get-donation campaign-id tx-sender)))
+    
+    (asserts! (> amount u0) err-zero-amount)
+    (asserts! (not (get is-completed campaign)) err-already-funded)
+    (asserts! (< stacks-block-height (get deadline campaign)) err-deadline-passed)
+    (asserts! (get is-active pledge) err-match-inactive)
+    (asserts! (> actual-match u0) err-match-exceeded)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (match current-donation
+      existing-donation (begin
+        (map-set donations
+          { campaign-id: campaign-id, donor: tx-sender }
+          { amount: (+ amount (get amount existing-donation)), claimed: false }
+        )
+      )
+      (map-insert donations
+        { campaign-id: campaign-id, donor: tx-sender }
+        { amount: amount, claimed: false }
+      )
+    )
+    
+    (map-set matched-donations
+      { campaign-id: campaign-id, donor: tx-sender, sponsor: sponsor }
+      { matched-amount: actual-match }
+    )
+    
+    (map-set matching-pledges
+      { campaign-id: campaign-id, sponsor: sponsor }
+      (merge pledge { current-matched: (+ (get current-matched pledge) actual-match) })
+    )
+    
+    (map-set campaigns
+      { campaign-id: campaign-id }
+      (merge campaign { current-amount: (+ (get current-amount campaign) amount actual-match) })
+    )
+    
+    (ok actual-match)
+  )
+)
+
+(define-public (deactivate-matching-pledge (campaign-id uint))
+  (let ((pledge (unwrap! (map-get? matching-pledges { campaign-id: campaign-id, sponsor: tx-sender }) err-not-found)))
+    (asserts! (get is-active pledge) err-match-inactive)
+    
+    (map-set matching-pledges
+      { campaign-id: campaign-id, sponsor: tx-sender }
+      (merge pledge { is-active: false })
+    )
+    
+    (let ((unused-amount (- (get max-match-amount pledge) (get current-matched pledge))))
+      (if (> unused-amount u0)
+        (as-contract (stx-transfer? unused-amount tx-sender tx-sender))
+        (ok true)
+      )
+    )
+  )
+)
+
+(define-read-only (get-matching-pledge (campaign-id uint) (sponsor principal))
+  (map-get? matching-pledges { campaign-id: campaign-id, sponsor: sponsor })
+)
+
+(define-read-only (get-matched-donation (campaign-id uint) (donor principal) (sponsor principal))
+  (map-get? matched-donations { campaign-id: campaign-id, donor: donor, sponsor: sponsor })
+)
+
+(define-read-only (calculate-match-amount (campaign-id uint) (sponsor principal) (donation-amount uint))
+  (match (get-matching-pledge campaign-id sponsor)
+    pledge 
+      (let 
+        ((match-amount (/ (* donation-amount (get match-ratio pledge)) u100))
+         (available-match (- (get max-match-amount pledge) (get current-matched pledge))))
+        (ok (if (<= match-amount available-match) match-amount available-match))
+      )
+    (ok u0)
+  )
+)

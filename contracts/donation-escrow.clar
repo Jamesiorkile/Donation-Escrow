@@ -126,7 +126,10 @@
       (merge campaign { current-amount: (+ (get current-amount campaign) amount) })
     )
     
-    (stx-transfer? amount tx-sender (as-contract tx-sender))
+    (begin
+      (update-donor-stats tx-sender amount campaign-id)
+      (stx-transfer? amount tx-sender (as-contract tx-sender))
+    )
   )
 )
 
@@ -394,7 +397,10 @@
       (merge campaign { current-amount: (+ (get current-amount campaign) amount actual-match) })
     )
     
-    (ok actual-match)
+    (begin
+      (update-donor-stats tx-sender amount campaign-id)
+      (ok actual-match)
+    )
   )
 )
 
@@ -433,5 +439,180 @@
         (ok (if (<= match-amount available-match) match-amount available-match))
       )
     (ok u0)
+  )
+)
+
+(define-map campaign-tips
+  { campaign-id: uint, tipper: principal }
+  { total-tips: uint }
+)
+
+(define-map campaign-tip-totals
+  { campaign-id: uint }
+  { total-tipped: uint }
+)
+
+(define-constant err-tip-too-small (err u114))
+(define-constant minimum-tip-amount u1000)
+
+(define-public (tip-campaign (campaign-id uint) (tip-amount uint))
+  (let 
+    ((campaign (unwrap! (get-campaign campaign-id) err-not-found))
+     (current-tips (default-to { total-tips: u0 } (map-get? campaign-tips { campaign-id: campaign-id, tipper: tx-sender })))
+     (current-total (default-to { total-tipped: u0 } (map-get? campaign-tip-totals { campaign-id: campaign-id }))))
+    (asserts! (>= tip-amount minimum-tip-amount) err-tip-too-small)
+    (asserts! (not (is-eq tx-sender (get owner campaign))) err-unauthorized)
+    
+    (try! (stx-transfer? tip-amount tx-sender (get owner campaign)))
+    
+    (map-set campaign-tips
+      { campaign-id: campaign-id, tipper: tx-sender }
+      { total-tips: (+ (get total-tips current-tips) tip-amount) }
+    )
+    
+    (map-set campaign-tip-totals
+      { campaign-id: campaign-id }
+      { total-tipped: (+ (get total-tipped current-total) tip-amount) }
+    )
+    
+    (ok tip-amount)
+  )
+)
+
+(define-read-only (get-campaign-tips (campaign-id uint) (tipper principal))
+  (map-get? campaign-tips { campaign-id: campaign-id, tipper: tipper })
+)
+
+(define-read-only (get-campaign-tip-total (campaign-id uint))
+  (default-to u0 (get total-tipped (map-get? campaign-tip-totals { campaign-id: campaign-id })))
+)
+
+(define-read-only (get-top-tippers (campaign-id uint))
+  (ok (get-campaign-tip-total campaign-id))
+)
+
+(define-map global-donor-stats
+  { donor: principal }
+  {
+    total-donated: uint,
+    campaigns-supported: uint,
+    largest-single-donation: uint,
+    rank-points: uint
+  }
+)
+
+(define-map leaderboard-rankings
+  { rank: uint }
+  { donor: principal, total-donated: uint }
+)
+
+(define-data-var total-leaderboard-entries uint u0)
+(define-constant max-leaderboard-size u50)
+
+(define-private (update-donor-stats (donor principal) (donation-amount uint) (campaign-id uint))
+  (let 
+    ((current-stats (default-to 
+      { total-donated: u0, campaigns-supported: u0, largest-single-donation: u0, rank-points: u0 } 
+      (map-get? global-donor-stats { donor: donor })))
+     (is-new-campaign (is-none (get-donation campaign-id donor)))
+     (new-total (+ (get total-donated current-stats) donation-amount))
+     (new-campaigns (if is-new-campaign 
+       (+ (get campaigns-supported current-stats) u1) 
+       (get campaigns-supported current-stats)))
+     (new-largest (if (> donation-amount (get largest-single-donation current-stats)) 
+       donation-amount 
+       (get largest-single-donation current-stats)))
+     (new-rank-points (+ (* new-total u1) (* new-campaigns u1000) (* new-largest u10))))
+    
+    (map-set global-donor-stats
+      { donor: donor }
+      {
+        total-donated: new-total,
+        campaigns-supported: new-campaigns,
+        largest-single-donation: new-largest,
+        rank-points: new-rank-points
+      }
+    )
+    (update-leaderboard donor new-total)
+    true
+  )
+)
+
+(define-private (update-leaderboard (donor principal) (total-donated uint))
+  (let ((current-entries (var-get total-leaderboard-entries)))
+    (if (< current-entries max-leaderboard-size)
+      (begin
+        (map-set leaderboard-rankings
+          { rank: (+ current-entries u1) }
+          { donor: donor, total-donated: total-donated }
+        )
+        (var-set total-leaderboard-entries (+ current-entries u1))
+      )
+      (insert-into-sorted-leaderboard donor total-donated)
+    )
+  )
+)
+
+(define-private (insert-into-sorted-leaderboard (donor principal) (total-donated uint))
+  (let ((lowest-entry (map-get? leaderboard-rankings { rank: max-leaderboard-size })))
+    (match lowest-entry
+      entry 
+        (if (> total-donated (get total-donated entry))
+          (map-set leaderboard-rankings
+            { rank: max-leaderboard-size }
+            { donor: donor, total-donated: total-donated }
+          )
+          true
+        )
+      true
+    )
+  )
+)
+
+(define-read-only (get-donor-stats (donor principal))
+  (map-get? global-donor-stats { donor: donor })
+)
+
+(define-read-only (get-leaderboard-entry (rank uint))
+  (map-get? leaderboard-rankings { rank: rank })
+)
+
+(define-read-only (get-donor-rank (donor principal))
+  (let ((donor-stats (map-get? global-donor-stats { donor: donor })))
+    (match donor-stats
+      stats 
+        (let ((total-donated (get total-donated stats)))
+          (get found-rank (fold check-rank-position 
+            (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20 u21 u22 u23 u24 u25 u26 u27 u28 u29 u30 u31 u32 u33 u34 u35 u36 u37 u38 u39 u40 u41 u42 u43 u44 u45 u46 u47 u48 u49 u50)
+            { donor: donor, target-donated: total-donated, found-rank: (some u999) }))
+        )
+      (some u999)
+    )
+  )
+)
+
+(define-private (check-rank-position (rank uint) (state { donor: principal, target-donated: uint, found-rank: (optional uint) }))
+  (if (is-some (get found-rank state))
+    state
+    (match (get-leaderboard-entry rank)
+      entry 
+        (if (is-eq (get donor entry) (get donor state))
+          (merge state { found-rank: (some rank) })
+          state
+        )
+      state
+    )
+  )
+)
+
+(define-read-only (get-top-donors (limit uint))
+  (let ((actual-limit (if (> limit max-leaderboard-size) max-leaderboard-size limit)))
+    (map get-leaderboard-entry 
+      (unwrap! (slice? 
+        (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20 u21 u22 u23 u24 u25 u26 u27 u28 u29 u30 u31 u32 u33 u34 u35 u36 u37 u38 u39 u40 u41 u42 u43 u44 u45 u46 u47 u48 u49 u50) 
+        u0 
+        actual-limit) 
+      (list))
+    )
   )
 )

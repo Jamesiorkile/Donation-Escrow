@@ -616,3 +616,293 @@
     )
   )
 )
+
+;; Phased Fund Withdrawal System
+;; Allows controlled release of campaign funds in predetermined phases
+
+(define-map withdrawal-phases
+  { campaign-id: uint, phase-id: uint }
+  {
+    percentage: uint,        ;; Percentage of total funds for this phase (0-100)
+    description: (string-ascii 200),
+    is-approved: bool,
+    is-withdrawn: bool,
+    withdrawn-amount: uint,
+    approved-by: (optional principal),
+    approved-at: (optional uint)
+  }
+)
+
+(define-map campaign-withdrawal-config
+  { campaign-id: uint }
+  {
+    total-phases: uint,
+    phases-created: uint,
+    total-withdrawn: uint,
+    is-phased-enabled: bool,
+    requires-verification: bool
+  }
+)
+
+(define-map phase-withdrawal-requests
+  { campaign-id: uint, phase-id: uint }
+  {
+    requested-by: principal,
+    requested-at: uint,
+    justification: (string-ascii 300),
+    status: (string-ascii 20)  ;; "pending", "approved", "rejected"
+  }
+)
+
+;; Error constants for phased withdrawals
+(define-constant err-phase-not-found (err u115))
+(define-constant err-phase-already-exists (err u116))
+(define-constant err-phase-not-approved (err u117))
+(define-constant err-phase-already-withdrawn (err u118))
+(define-constant err-invalid-percentage (err u119))
+(define-constant err-phases-exceed-100 (err u120))
+(define-constant err-phased-not-enabled (err u121))
+(define-constant err-request-already-exists (err u122))
+(define-constant err-invalid-phase-order (err u123))
+
+;; Enable phased withdrawal for a campaign (only owner can call)
+(define-public (enable-phased-withdrawal (campaign-id uint) (total-phases uint) (requires-verification bool))
+  (let ((campaign (unwrap! (get-campaign campaign-id) err-not-found)))
+    (asserts! (is-eq tx-sender (get owner campaign)) err-unauthorized)
+    (asserts! (not (get is-completed campaign)) err-already-funded)
+    (asserts! (> total-phases u0) err-zero-amount)
+    (asserts! (<= total-phases u10) err-invalid-percentage) ;; Max 10 phases
+    
+    (map-set campaign-withdrawal-config
+      { campaign-id: campaign-id }
+      {
+        total-phases: total-phases,
+        phases-created: u0,
+        total-withdrawn: u0,
+        is-phased-enabled: true,
+        requires-verification: requires-verification
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Create a withdrawal phase (only campaign owner)
+(define-public (create-withdrawal-phase (campaign-id uint) (phase-id uint) (percentage uint) (description (string-ascii 200)))
+  (let 
+    ((campaign (unwrap! (get-campaign campaign-id) err-not-found))
+     (config (unwrap! (map-get? campaign-withdrawal-config { campaign-id: campaign-id }) err-phased-not-enabled)))
+    
+    (asserts! (is-eq tx-sender (get owner campaign)) err-unauthorized)
+    (asserts! (get is-phased-enabled config) err-phased-not-enabled)
+    (asserts! (> percentage u0) err-invalid-percentage)
+    (asserts! (<= percentage u100) err-invalid-percentage)
+    (asserts! (< (get phases-created config) (get total-phases config)) err-phase-already-exists)
+    
+    ;; Check if phase already exists
+    (asserts! (is-none (map-get? withdrawal-phases { campaign-id: campaign-id, phase-id: phase-id })) err-phase-already-exists)
+    
+    ;; Validate total percentage doesn't exceed 100%
+    (let ((total-percentage (+ percentage (get-total-phase-percentage campaign-id))))
+      (asserts! (<= total-percentage u100) err-phases-exceed-100)
+    )
+    
+    ;; Create the phase
+    (map-set withdrawal-phases
+      { campaign-id: campaign-id, phase-id: phase-id }
+      {
+        percentage: percentage,
+        description: description,
+        is-approved: false,
+        is-withdrawn: false,
+        withdrawn-amount: u0,
+        approved-by: none,
+        approved-at: none
+      }
+    )
+    
+    ;; Update config
+    (map-set campaign-withdrawal-config
+      { campaign-id: campaign-id }
+      (merge config { phases-created: (+ (get phases-created config) u1) })
+    )
+    
+    (ok phase-id)
+  )
+)
+
+;; Request phase withdrawal (only campaign owner)
+(define-public (request-phase-withdrawal (campaign-id uint) (phase-id uint) (justification (string-ascii 300)))
+  (let 
+    ((campaign (unwrap! (get-campaign campaign-id) err-not-found))
+     (phase (unwrap! (map-get? withdrawal-phases { campaign-id: campaign-id, phase-id: phase-id }) err-phase-not-found))
+     (config (unwrap! (map-get? campaign-withdrawal-config { campaign-id: campaign-id }) err-phased-not-enabled)))
+    
+    (asserts! (is-eq tx-sender (get owner campaign)) err-unauthorized)
+    (asserts! (get is-completed campaign) err-unauthorized)
+    (asserts! (not (get is-withdrawn phase)) err-phase-already-withdrawn)
+    
+    ;; Check if request already exists
+    (asserts! (is-none (map-get? phase-withdrawal-requests { campaign-id: campaign-id, phase-id: phase-id })) err-request-already-exists)
+    
+    ;; If verification not required, auto-approve
+    (if (not (get requires-verification config))
+      (begin
+        (map-set withdrawal-phases
+          { campaign-id: campaign-id, phase-id: phase-id }
+          (merge phase { 
+            is-approved: true, 
+            approved-by: (some tx-sender),
+            approved-at: (some stacks-block-height)
+          })
+        )
+        (map-set phase-withdrawal-requests
+          { campaign-id: campaign-id, phase-id: phase-id }
+          {
+            requested-by: tx-sender,
+            requested-at: stacks-block-height,
+            justification: justification,
+            status: "approved"
+          }
+        )
+      )
+      (map-set phase-withdrawal-requests
+        { campaign-id: campaign-id, phase-id: phase-id }
+        {
+          requested-by: tx-sender,
+          requested-at: stacks-block-height,
+          justification: justification,
+          status: "pending"
+        }
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+;; Approve phase withdrawal (only verifiers)
+(define-public (approve-phase-withdrawal (campaign-id uint) (phase-id uint))
+  (let 
+    ((phase (unwrap! (map-get? withdrawal-phases { campaign-id: campaign-id, phase-id: phase-id }) err-phase-not-found))
+     (request (unwrap! (map-get? phase-withdrawal-requests { campaign-id: campaign-id, phase-id: phase-id }) err-not-found)))
+    
+    (asserts! (is-verifier tx-sender) err-unauthorized)
+    (asserts! (is-eq (get status request) "pending") err-phase-already-withdrawn)
+    (asserts! (not (get is-approved phase)) err-phase-already-withdrawn)
+    
+    ;; Update phase approval
+    (map-set withdrawal-phases
+      { campaign-id: campaign-id, phase-id: phase-id }
+      (merge phase { 
+        is-approved: true,
+        approved-by: (some tx-sender),
+        approved-at: (some stacks-block-height)
+      })
+    )
+    
+    ;; Update request status
+    (map-set phase-withdrawal-requests
+      { campaign-id: campaign-id, phase-id: phase-id }
+      (merge request { status: "approved" })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Execute phase withdrawal (only campaign owner)
+(define-public (execute-phase-withdrawal (campaign-id uint) (phase-id uint))
+  (let 
+    ((campaign (unwrap! (get-campaign campaign-id) err-not-found))
+     (phase (unwrap! (map-get? withdrawal-phases { campaign-id: campaign-id, phase-id: phase-id }) err-phase-not-found))
+     (config (unwrap! (map-get? campaign-withdrawal-config { campaign-id: campaign-id }) err-phased-not-enabled)))
+    
+    (asserts! (is-eq tx-sender (get owner campaign)) err-unauthorized)
+    (asserts! (get is-approved phase) err-phase-not-approved)
+    (asserts! (not (get is-withdrawn phase)) err-phase-already-withdrawn)
+    
+    ;; Calculate withdrawal amount
+    (let 
+      ((withdrawal-amount (/ (* (get current-amount campaign) (get percentage phase)) u100))
+       (available-amount (- (get current-amount campaign) (get total-withdrawn config))))
+      
+      (asserts! (<= withdrawal-amount available-amount) err-goal-not-met)
+      
+      ;; Execute transfer
+      (try! (as-contract (stx-transfer? withdrawal-amount tx-sender (get owner campaign))))
+      
+      ;; Update phase as withdrawn
+      (map-set withdrawal-phases
+        { campaign-id: campaign-id, phase-id: phase-id }
+        (merge phase { 
+          is-withdrawn: true,
+          withdrawn-amount: withdrawal-amount
+        })
+      )
+      
+      ;; Update total withdrawn
+      (map-set campaign-withdrawal-config
+        { campaign-id: campaign-id }
+        (merge config { total-withdrawn: (+ (get total-withdrawn config) withdrawal-amount) })
+      )
+      
+      (ok withdrawal-amount)
+    )
+  )
+)
+
+;; Helper function to calculate total percentage of all phases
+(define-private (get-total-phase-percentage (campaign-id uint))
+  (let ((config (map-get? campaign-withdrawal-config { campaign-id: campaign-id })))
+    (match config
+      conf 
+        (get total (fold calculate-phase-percentage 
+          (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)
+          { campaign-id: campaign-id, total: u0 }))
+      u0
+    )
+  )
+)
+
+(define-private (calculate-phase-percentage (phase-id uint) (state { campaign-id: uint, total: uint }))
+  (let ((phase (map-get? withdrawal-phases { campaign-id: (get campaign-id state), phase-id: phase-id })))
+    (match phase
+      p (merge state { total: (+ (get total state) (get percentage p)) })
+      state
+    )
+  )
+)
+
+;; Read-only functions
+(define-read-only (get-withdrawal-phase (campaign-id uint) (phase-id uint))
+  (map-get? withdrawal-phases { campaign-id: campaign-id, phase-id: phase-id })
+)
+
+(define-read-only (get-campaign-withdrawal-config (campaign-id uint))
+  (map-get? campaign-withdrawal-config { campaign-id: campaign-id })
+)
+
+(define-read-only (get-phase-withdrawal-request (campaign-id uint) (phase-id uint))
+  (map-get? phase-withdrawal-requests { campaign-id: campaign-id, phase-id: phase-id })
+)
+
+(define-read-only (is-phase-withdrawable (campaign-id uint) (phase-id uint))
+  (match (get-withdrawal-phase campaign-id phase-id)
+    phase (and (get is-approved phase) (not (get is-withdrawn phase)))
+    false
+  )
+)
+
+(define-read-only (get-remaining-withdrawal-amount (campaign-id uint))
+  (match (get-campaign-withdrawal-config campaign-id)
+    config 
+      (match (get-campaign campaign-id)
+        campaign (- (get current-amount campaign) (get total-withdrawn config))
+        u0
+      )
+    u0
+  )
+)
+
+
